@@ -1,0 +1,2 @@
+# 리눅스 서버용. 경로 두 곳을 고쳐서 `crontab -e`에 붙인다.
+*/5 * * * * cd /home/ubuntu/skala-aiops-jimjak && /usr/bin/python3 -m collector tick >> /home/ubuntu/jimjak-collector.log 2>&1

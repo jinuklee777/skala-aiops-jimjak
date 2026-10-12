@@ -1,0 +1,194 @@
+"""알림: 멈춤 감시, 일일 보고, 웹훅·하트비트."""
+from __future__ import annotations
+
+import json
+import logging
+import statistics
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta
+
+from collector import __version__, db, flights
+from collector.config import KST, iso, parse_time
+from collector.schedule import PRIMARY_JOB
+
+log = logging.getLogger("collector")
+
+PREFIX = "[짐작 수집기]"
+REPEAT_HOURS = 6  # 멈춤이 이어지면 이 간격으로 다시 알린다
+WEEKDAYS = "월화수목금토일"
+
+
+def short(moment) -> str:
+    """'10/12 14:20' 꼴."""
+    return parse_time(moment).strftime("%m/%d %H:%M") if moment else "-"
+
+
+def webhook_payload(url, message) -> dict:
+    # 디스코드 웹훅은 content, 슬랙 같은 나머지는 text를 읽는다.
+    key = "content" if "discord" in urllib.parse.urlparse(url).netloc else "text"
+    return {key: message[:1900]}
+
+
+def _request(url, data=None) -> None:
+    headers = {"User-Agent": f"jimjak-collector/{__version__}"}
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    with urllib.request.urlopen(urllib.request.Request(url, data=data, headers=headers), timeout=10) as response:
+        response.read()
+
+
+def send(cfg, message) -> bool:
+    """웹훅으로 보낸다. 웹훅이 없으면 로그에만 남는다."""
+    log.info("알림: %s", message)
+    if not cfg.webhook_url:
+        return False
+    try:
+        _request(cfg.webhook_url, json.dumps(webhook_payload(cfg.webhook_url, message)).encode("utf-8"))
+        return True
+    except Exception as error:
+        log.error("알림을 보내지 못함: %s", error)
+        return False
+
+
+def ping(url) -> bool:
+    """하트비트. healthchecks.io 같은 바깥 감시는 이 신호가 끊기면 알린다. 컴퓨터가 꺼져도 알 수 있다."""
+    if not url:
+        return False
+    try:
+        _request(url)
+        return True
+    except Exception as error:
+        log.warning("하트비트를 보내지 못함: %s", error)
+        return False
+
+
+def check(collector) -> None:
+    for step in (check_stale, send_daily_report):
+        try:
+            step(collector)
+        except Exception:
+            log.exception("%s 실패", step.__name__)
+
+
+def check_stale(collector) -> None:
+    """마지막으로 데이터를 받은 지 stale_minutes가 지나면 알리고, 다시 받으면 재개를 알린다."""
+    cfg, conn, now = collector.cfg, collector.conn, collector.clock()
+    first = db.first_run_at(conn, PRIMARY_JOB)
+    if first is None:
+        return
+    last = db.last_data_at(conn, PRIMARY_JOB)
+    minutes = int((now - parse_time(last or first)).total_seconds() // 60)
+    state, sent_at = db.get_notice(conn, "stale")
+    if minutes >= cfg.stale_minutes:
+        if state == "stale" and now - parse_time(sent_at) < timedelta(hours=REPEAT_HOURS):
+            return
+        since = f"마지막 성공 {short(last)} ({minutes}분 전)" if last else f"{short(first)}부터 한 번도 받지 못함"
+        send(cfg, f"{PREFIX} 수집 멈춤: {since}. 최근 오류: {db.last_error(conn, PRIMARY_JOB) or '기록 없음'}")
+        db.set_notice(conn, "stale", "stale", iso(now))
+    elif state == "stale":
+        send(cfg, f"{PREFIX} 수집 재개: {short(last)}에 받음")
+        db.set_notice(conn, "stale", "ok", iso(now))
+
+
+def send_daily_report(collector) -> None:
+    """report_hour가 지나면 하루 한 번 어제 수집 결과를 보낸다."""
+    now = collector.clock()
+    if now.hour < collector.cfg.report_hour:
+        return
+    today = now.date().isoformat()
+    state, _ = db.get_notice(collector.conn, "report")
+    if state == today:
+        return
+    yesterday = now.date() - timedelta(days=1)
+    first = db.first_run_at(collector.conn, PRIMARY_JOB)
+    if first and parse_time(first).date() <= yesterday:
+        send(collector.cfg, format_summary(daily_summary(collector, yesterday)))
+    db.set_notice(collector.conn, "report", today, iso(now))
+
+
+def label_counts(conn, day) -> dict:
+    """그날 도착 예정편(최신 상태 기준)의 정답(마지막 짐 시각) 확보 현황."""
+    counts = dict.fromkeys(("flights", "cancelled", "no_carousel", "arrived", "with_last",
+                            "late_arrived", "late_with_last"), 0)
+    for row in conn.execute("SELECT item FROM latest WHERE job = ? AND flight_key LIKE ?",
+                            (PRIMARY_JOB, f"%|{day:%Y%m%d}%")):
+        item = json.loads(row["item"])
+        counts["flights"] += 1
+        remark = flights.text(item, "remark")
+        if remark == "결항":
+            counts["cancelled"] += 1
+            continue
+        counts["no_carousel"] += not flights.text(item, "bagCarouselId")
+        if remark != "도착":
+            continue
+        has_last = bool(flights.text(item, "bagLastTime"))
+        counts["arrived"] += 1
+        counts["with_last"] += has_last
+        if flights.text(item, "scheduleDatetime")[8:10] == "23":
+            counts["late_arrived"] += 1
+            counts["late_with_last"] += has_last
+    return counts
+
+
+def daily_summary(collector, day) -> dict:
+    cfg, conn = collector.cfg, collector.conn
+    job = collector.jobs[PRIMARY_JOB]
+    start = datetime(day.year, day.month, day.day, tzinfo=KST)
+    end = start + timedelta(days=1)
+    first = db.first_run_at(conn, PRIMARY_JOB)
+    first_slot = job.slot(parse_time(first)) if first else end  # 처음 돌기 시작한 날은 그 뒤만 센다
+    expected = [iso(slot) for slot in job.slots_on(day) if slot >= first_slot]
+    statuses = {}
+    for row in db.runs_between(conn, PRIMARY_JOB, iso(start), iso(end)):
+        statuses.setdefault(row["slot"], set()).add(row["status"])
+    summary = {
+        "day": day,
+        "expected": len(expected),
+        "ok": sum("ok" in found for found in statuses.values()),
+        "partial": sum("ok" not in found and "partial" in found for found in statuses.values()),
+        "failed": sum(not (found & {"ok", "partial"}) for found in statuses.values()),
+        "missed": sum(slot not in statuses for slot in expected),
+        "calls": db.calls_between(conn, iso(start), iso(end)),
+        "daily_limit": cfg.daily_limit,
+        "raw_bytes": sum(path.stat().st_size for path in cfg.raw_dir.glob(f"*/{day.isoformat()}/*.json.gz")),
+        **label_counts(conn, day),
+    }
+    previous = [label_counts(conn, day - timedelta(days=k))["flights"] for k in range(1, 8)]
+    previous = [count for count in previous if count]
+    summary["usual_flights"] = statistics.median(previous) if len(previous) >= 3 else None
+    summary["warnings"] = warnings_for(summary)
+    return summary
+
+
+def warnings_for(s) -> list:
+    warnings = []
+    received = s["ok"] + s["partial"]
+    if s["expected"] and received < 0.9 * s["expected"]:
+        warnings.append(f"받은 회차({received})가 예정({s['expected']})의 90%에 못 미침")
+    if s["expected"] and s["partial"] > 0.1 * s["expected"]:
+        warnings.append(f"일부 쪽만 받은 회차가 {s['partial']}번")
+    if s["usual_flights"] and s["flights"] < 0.7 * s["usual_flights"]:
+        warnings.append(f"편 수({s['flights']})가 평소({s['usual_flights']:.0f})보다 크게 적음")
+    if s["calls"] > 0.9 * s["daily_limit"]:
+        warnings.append(f"호출 수({s['calls']})가 하루 한도({s['daily_limit']})에 가까움")
+    return warnings
+
+
+def percent(part, whole) -> str:
+    return f" ({part / whole:.0%})" if whole else ""
+
+
+def format_summary(s) -> str:
+    day = s["day"]
+    label = f"{day:%m/%d}({WEEKDAYS[day.weekday()]})"
+    lines = [
+        f"{PREFIX} {label} 수집 보고",
+        f"- 회차: 성공 {s['ok']} · 일부 {s['partial']} · 실패 {s['failed']} · 빠짐 {s['missed']} / 예정 {s['expected']}",
+        f"- 호출: {s['calls']}회 (하루 한도 {s['daily_limit']})",
+        f"- 도착 예정 {s['flights']}편: 결항 {s['cancelled']}, 수취대 미배정 {s['no_carousel']}, "
+        f"도착 {s['arrived']}편 중 마지막 짐 시각 확보 {s['with_last']}편{percent(s['with_last'], s['arrived'])}",
+        f"- 23시대 도착 {s['late_arrived']}편 중 마지막 짐 시각 확보 {s['late_with_last']}편",
+        f"- 원본: {s['raw_bytes'] / 1e6:.1f}MB",
+    ]
+    return "\n".join(lines + [f"⚠ {warning}" for warning in s["warnings"]])
