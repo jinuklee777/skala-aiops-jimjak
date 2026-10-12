@@ -68,16 +68,16 @@ class AlertsTest(unittest.TestCase):
         self.tick_at(2026, 10, 13, 9, 10, 30)
         reports = [message for message in self.messages() if "수집 보고" in message]
         self.assertEqual(len(reports), 1)
-        self.assertEqual(reports[0].splitlines(), [
+        lines = reports[0].splitlines()
+        self.assertEqual(lines[:5], [
             "[짐작 수집기] 10/12(월) 수집 보고",
             "- 회차: 성공 2 · 일부 0 · 실패 0 · 빠짐 61 / 예정 63",  # 14:00 첫 실행부터 자정까지 63회
             "- 호출: 5회 (하루 한도 500)",
             "- 도착 예정 4편: 결항 1, 수취대 미배정 0, 도착 2편 중 마지막 짐 시각 확보 2편 (100%)",
             "- 23시대 도착 0편 중 마지막 짐 시각 확보 0편",
-            reports[0].splitlines()[5],
-            "⚠ 받은 회차(2)가 예정(63)의 90%에 못 미침",
         ])
-        self.assertTrue(reports[0].splitlines()[5].startswith("- 원본: "))
+        self.assertRegex(lines[5], r"^- 원본: [\d.]+MB · 디스크 여유 [\d.]+GB$")
+        self.assertIn("⚠ 받은 회차(2)가 예정(63)의 90%에 못 미침", lines)
 
 
 class WebhookPayloadTest(unittest.TestCase):

@@ -125,11 +125,11 @@ states = flights.state_as_of(conn, "arrivals", "2026-10-12T14:00:00+09:00")
 - 호출: 4회 (하루 한도 500)
 - 도착 예정 568편: 결항 0, 수취대 미배정 7, 도착 519편 중 마지막 짐 시각 확보 497편 (96%)
 - 23시대 도착 0편 중 마지막 짐 시각 확보 0편
-- 원본: 0.1MB
+- 원본: 0.1MB · 디스크 여유 3.2GB
 ⚠ 받은 회차(1)가 예정(34)의 90%에 못 미침
 ```
 
-경고는 받은 회차가 예정의 90% 미만, 일부만 받은 회차가 10% 초과, 편 수가 지난 7일 중앙값의 70% 미만, 호출이 한도의 90% 초과일 때 붙는다.
+경고는 받은 회차가 예정의 90% 미만, 일부만 받은 회차가 10% 초과, 편 수가 지난 7일 중앙값의 70% 미만, 호출이 한도의 90% 초과, 디스크 여유가 2GB 미만일 때 붙는다.
 
 ## 자동 실행
 
@@ -148,7 +148,19 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/jimjak.collector.plist
 
 ### 리눅스 서버
 
-`collector/deploy/crontab.example`의 경로를 고쳐 `crontab -e`에 붙인다. 옮길 때는 `collector/data/`를 통째로 복사한다. 원본만 있어도 `rebuild`로 표를 다시 만들 수 있다.
+2026-10-12부터 GCP VM(us-central1, Debian 12)에서 cron으로 돈다. 미국 리전에서도 data.go.kr 호출이 된다.
+
+1. 코드만 받는다.
+   ```bash
+   git clone --depth 1 --filter=blob:none --sparse -b collector https://github.com/jinuklee777/skala-aiops-jimjak.git
+   cd skala-aiops-jimjak && git sparse-checkout set collector
+   ```
+2. `collector/.env`를 옮기고 `chmod 600 collector/.env`.
+3. 이미 받은 데이터가 있으면 `collector/data/`를 통째로 옮긴다. DB는 다른 곳에서 쓰는 중이 아닐 때 `PRAGMA wal_checkpoint(TRUNCATE)`를 한 뒤 옮긴다. 원본만 있어도 `rebuild`로 표를 다시 만들 수 있다.
+4. `collector/deploy/crontab.example`의 경로를 고쳐 `crontab -e`에 붙인다.
+5. 같은 키로 두 곳에서 동시에 돌리지 않는다. 하루 호출 한도를 넘는다.
+
+코드를 고치면 서버에서 `git pull`로 반영한다.
 
 ## 필드 확인 결과
 

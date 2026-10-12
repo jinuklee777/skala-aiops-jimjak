@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 import statistics
 import urllib.parse
 import urllib.request
@@ -16,6 +17,7 @@ log = logging.getLogger("collector")
 
 PREFIX = "[짐작 수집기]"
 REPEAT_HOURS = 6  # 멈춤이 이어지면 이 간격으로 다시 알린다
+MIN_FREE_BYTES = 2 * 10**9  # 디스크 여유가 이보다 적으면 일일 보고에 경고를 붙인다
 WEEKDAYS = "월화수목금토일"
 
 
@@ -152,6 +154,7 @@ def daily_summary(collector, day) -> dict:
         "calls": db.calls_between(conn, iso(start), iso(end)),
         "daily_limit": cfg.daily_limit,
         "raw_bytes": sum(path.stat().st_size for path in cfg.raw_dir.glob(f"*/{day.isoformat()}/*.json.gz")),
+        "disk_free": shutil.disk_usage(cfg.data_dir).free,
         **label_counts(conn, day),
     }
     previous = [label_counts(conn, day - timedelta(days=k))["flights"] for k in range(1, 8)]
@@ -172,6 +175,8 @@ def warnings_for(s) -> list:
         warnings.append(f"편 수({s['flights']})가 평소({s['usual_flights']:.0f})보다 크게 적음")
     if s["calls"] > 0.9 * s["daily_limit"]:
         warnings.append(f"호출 수({s['calls']})가 하루 한도({s['daily_limit']})에 가까움")
+    if s["disk_free"] < MIN_FREE_BYTES:
+        warnings.append(f"디스크 여유가 {s['disk_free'] / 1e9:.1f}GB뿐")
     return warnings
 
 
@@ -189,6 +194,6 @@ def format_summary(s) -> str:
         f"- 도착 예정 {s['flights']}편: 결항 {s['cancelled']}, 수취대 미배정 {s['no_carousel']}, "
         f"도착 {s['arrived']}편 중 마지막 짐 시각 확보 {s['with_last']}편{percent(s['with_last'], s['arrived'])}",
         f"- 23시대 도착 {s['late_arrived']}편 중 마지막 짐 시각 확보 {s['late_with_last']}편",
-        f"- 원본: {s['raw_bytes'] / 1e6:.1f}MB",
+        f"- 원본: {s['raw_bytes'] / 1e6:.1f}MB · 디스크 여유 {s['disk_free'] / 1e9:.1f}GB",
     ]
     return "\n".join(lines + [f"⚠ {warning}" for warning in s["warnings"]])
