@@ -70,7 +70,8 @@ def cmd_run(cfg, args):
 def cmd_status(cfg, args):
     print(f"데이터 폴더: {cfg.data_dir}")
     print(f"서비스키: {'있음' if cfg.service_key else '없음 (collector/.env에 DATA_GO_KR_SERVICE_KEY)'}")
-    print(f"알림: 웹훅 {'있음' if cfg.webhook_url else '없음'} · 하트비트 {'있음' if cfg.heartbeat_url else '없음'}")
+    print(f"알림: 웹훅 {'있음' if cfg.webhook_url else '없음'} · 알림 명령 {'있음' if cfg.notify_command else '없음'} · "
+          f"하트비트 {'있음' if cfg.heartbeat_url else '없음'}")
     if not cfg.db_path.exists():
         print("아직 수집 기록이 없다.")
         return 0
@@ -165,11 +166,22 @@ def cmd_rebuild(cfg, args):
 
 
 def cmd_notify_test(cfg, args):
-    sent = alerts.send(cfg, f"{alerts.PREFIX} 알림 시험. 이 메시지가 보이면 알림 설정이 된 것이다.")
-    pinged = alerts.ping(cfg.heartbeat_url)
-    print("웹훅:", "보냄" if sent else "실패 (로그 확인)" if cfg.webhook_url else "설정 안 됨 (COLLECTOR_WEBHOOK_URL)")
-    print("하트비트:", "보냄" if pinged else "실패 (로그 확인)" if cfg.heartbeat_url else "설정 안 됨 (COLLECTOR_HEARTBEAT_URL)")
-    return 0 if sent == bool(cfg.webhook_url) and pinged == bool(cfg.heartbeat_url) else 1
+    message = f"{alerts.PREFIX} 알림 시험. 이 메시지가 보이면 알림 설정이 된 것이다."
+    channels = (
+        ("웹훅", cfg.webhook_url, "COLLECTOR_WEBHOOK_URL", lambda: alerts.post_webhook(cfg.webhook_url, message)),
+        ("알림 명령", cfg.notify_command, "COLLECTOR_NOTIFY_COMMAND",
+         lambda: alerts.run_command(cfg.notify_command, message)),
+        ("하트비트", cfg.heartbeat_url, "COLLECTOR_HEARTBEAT_URL", lambda: alerts.ping(cfg.heartbeat_url)),
+    )
+    ok = True
+    for name, configured, env_var, deliver in channels:
+        if not configured:
+            print(f"{name}: 설정 안 됨 ({env_var})")
+            continue
+        done = deliver()
+        ok = ok and done
+        print(f"{name}: {'보냄' if done else '실패 (로그 확인)'}")
+    return 0 if ok else 1
 
 
 COMMANDS = {"tick": cmd_tick, "run": cmd_run, "status": cmd_status, "asof": cmd_asof,

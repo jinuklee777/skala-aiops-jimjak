@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import json
 import logging
+import shlex
 import shutil
 import statistics
+import subprocess
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta
@@ -18,6 +20,7 @@ log = logging.getLogger("collector")
 PREFIX = "[짐작 수집기]"
 REPEAT_HOURS = 6  # 멈춤이 이어지면 이 간격으로 다시 알린다
 MIN_FREE_BYTES = 2 * 10**9  # 디스크 여유가 이보다 적으면 일일 보고에 경고를 붙인다
+COMMAND_TIMEOUT = 200  # 초. 알림 명령이 모델을 부르면 오래 걸릴 수 있다
 WEEKDAYS = "월화수목금토일"
 
 
@@ -41,16 +44,38 @@ def _request(url, data=None) -> None:
 
 
 def send(cfg, message) -> bool:
-    """웹훅으로 보낸다. 웹훅이 없으면 로그에만 남는다."""
+    """웹훅과 알림 명령으로 보낸다. 둘 다 없으면 로그에만 남는다."""
     log.info("알림: %s", message)
-    if not cfg.webhook_url:
+    sent = post_webhook(cfg.webhook_url, message)
+    return run_command(cfg.notify_command, message) or sent
+
+
+def post_webhook(url, message) -> bool:
+    if not url:
         return False
     try:
-        _request(cfg.webhook_url, json.dumps(webhook_payload(cfg.webhook_url, message)).encode("utf-8"))
+        _request(url, json.dumps(webhook_payload(url, message)).encode("utf-8"))
         return True
     except Exception as error:
-        log.error("알림을 보내지 못함: %s", error)
+        log.error("웹훅으로 알림을 보내지 못함: %s", error)
         return False
+
+
+def run_command(command, message) -> bool:
+    """알림 명령 끝에 메시지를 인자 하나로 붙여 실행한다. 종료 코드가 0이면 보낸 것으로 본다."""
+    if not command:
+        return False
+    try:
+        result = subprocess.run(shlex.split(command) + [message], capture_output=True, text=True,
+                                timeout=COMMAND_TIMEOUT)
+    except (OSError, subprocess.SubprocessError) as error:
+        log.error("알림 명령을 실행하지 못함: %s", error)
+        return False
+    if result.returncode != 0:
+        log.error("알림 명령 실패(종료 코드 %d): %s", result.returncode,
+                  (result.stderr or result.stdout).strip()[-300:])
+        return False
+    return True
 
 
 def ping(url) -> bool:

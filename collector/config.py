@@ -47,6 +47,7 @@ class Config:
     max_attempts: int = 3
     heartbeat_url: str = ""
     webhook_url: str = ""
+    notify_command: str = ""  # 알림 메시지를 마지막 인자로 붙여 실행할 명령
     stale_minutes: int = 60
     report_hour: int = 9
     daily_limit: int = 500
@@ -76,6 +77,7 @@ ENV_VARS = {
     "COLLECTOR_MAX_ATTEMPTS": ("max_attempts", int),
     "COLLECTOR_HEARTBEAT_URL": ("heartbeat_url", str),
     "COLLECTOR_WEBHOOK_URL": ("webhook_url", str),
+    "COLLECTOR_NOTIFY_COMMAND": ("notify_command", str),
     "COLLECTOR_STALE_MINUTES": ("stale_minutes", int),
     "COLLECTOR_REPORT_HOUR": ("report_hour", int),
     "COLLECTOR_DAILY_LIMIT": ("daily_limit", int),

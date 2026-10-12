@@ -1,6 +1,9 @@
 import json
+import shlex
+import sys
 import tempfile
 import unittest
+from pathlib import Path
 
 from collector import alerts
 from collector.collect import Collector
@@ -78,6 +81,22 @@ class AlertsTest(unittest.TestCase):
         ])
         self.assertRegex(lines[5], r"^- 원본: [\d.]+MB · 디스크 여유 [\d.]+GB$")
         self.assertIn("⚠ 받은 회차(2)가 예정(63)의 90%에 못 미침", lines)
+
+
+class NotifyCommandTest(unittest.TestCase):
+    def test_passes_the_message_as_the_last_argument(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out, script = Path(tmp) / "args.json", Path(tmp) / "notify.py"
+            script.write_text("import json, sys\n"
+                              "open(sys.argv[1], 'w').write(json.dumps(sys.argv[2:], ensure_ascii=False))\n")
+            command = " ".join(shlex.quote(part) for part in (sys.executable, str(script), str(out))) + " --agent ibuki"
+            self.assertTrue(alerts.run_command(command, "수집 멈춤: 마지막 성공 10/12 14:00"))
+            self.assertEqual(json.loads(out.read_text()), ["--agent", "ibuki", "수집 멈춤: 마지막 성공 10/12 14:00"])
+
+    def test_failures_return_false_without_raising(self):
+        self.assertFalse(alerts.run_command(f"{shlex.quote(sys.executable)} -c 'raise SystemExit(3)'", "x"))
+        self.assertFalse(alerts.run_command("/nonexistent/notify", "x"))
+        self.assertFalse(alerts.run_command("", "x"))
 
 
 class WebhookPayloadTest(unittest.TestCase):
