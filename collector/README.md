@@ -105,6 +105,7 @@ states = flights.state_as_of(conn, "arrivals", "2026-10-12T14:00:00+09:00")
 - T 직전에 수집이 끊겼으면 값이 오래됐을 수 있다. `asof`가 함께 알려 주는 "그 전 마지막 수집" 시각을 본다.
 - "응답에서 사라짐"은 빠짐없이 받은 수집에서만 판정한다. 편 수가 직전의 절반 아래로 급감하면 응답 이상으로 보고 판정하지 않는다.
 - 편 상태 표는 원본에서 만든 것이다. 규칙을 바꾸거나 DB가 망가지면 `rebuild`로 원본에서 다시 만든다.
+  서버에는 원본이 최근 30일 치만 있으니, 서버에서 `rebuild`하기 전에는 Drive에서 원본 전체를 받는다([복구](#복구)). 안 받고 돌리면 30일보다 오래된 편 이력이 표에서 사라진다.
 
 ## 멈춤 알림
 
@@ -162,6 +163,57 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/jimjak.collector.plist
 5. 같은 키로 두 곳에서 동시에 돌리지 않는다. 하루 호출 한도를 넘는다.
 
 코드를 고치면 서버에서 `git pull`로 반영한다.
+
+## 백업과 복구
+
+서버의 원본과 DB를 하루 한 번 Google Drive로 백업한다(`collector/deploy/backup.sh`, [rclone](https://rclone.org/drive/) 사용). 서버 디스크가 망가지거나 VM을 지워도 수집한 이력은 남는다.
+
+| 무엇 | Drive 위치 | 보관 |
+|---|---|---|
+| 원본 | `jimjak-collector/raw/<작업>/<날짜>/` | 전부. 서버에서 지운 파일도 Drive에는 남는다 |
+| DB 스냅샷 | `jimjak-collector/db/collector-<날짜>.db.gz` | 최근 14일(`BACKUP_DB_KEEP_DAYS`). 지난 것은 Drive 휴지통으로 간다 |
+
+- 서버에는 원본을 최근 30일(`BACKUP_KEEP_DAYS`) 치만 둔다. 그보다 오래된 날짜 폴더는 Drive에 있는 것과 MD5까지 같은지 `rclone check`로 확인한 뒤에만 지운다. 다르면 지우지 않고 알린다.
+- DB 스냅샷은 SQLite 백업 API로 뜬다. 수집이 돌고 있어도 한 시점의 일관된 사본이 된다. 올리기 전에 `PRAGMA quick_check`로 검사한다.
+- 실패하면 수집기 알림(웹훅·알림 명령)으로 "백업 실패"를 보낸다. 로그는 `~/jimjak-backup.log`.
+- 서비스키(`.env`)와 rclone 토큰은 백업하지 않는다. 서비스키는 data.go.kr 마이페이지에서 다시 볼 수 있다.
+
+### 처음 한 번
+
+1. Google Cloud 콘솔에서 Drive API를 켜고 OAuth 클라이언트(데스크톱 앱)를 만든다. 범위는 `drive.file`이다. rclone이 만든 파일만 보여서 Drive의 다른 파일은 건드리지 못한다.
+   동의 화면은 「프로덕션」으로 게시한다. 테스트 상태로 두면 토큰이 7일 뒤 만료되어 백업이 멈춘다.
+2. 서버에서 `rclone config`로 `gdrive` 리모트를 만든다. 서버에는 브라우저가 없으니 자동 인증 물음에 `n`을 답한다.
+   그러면 `rclone authorize ...` 줄이 나온다. 이 줄을 브라우저가 있는 컴퓨터에서 실행하고, 받은 토큰을 서버에 붙인다([rclone 원격 설정](https://rclone.org/remote_setup/)).
+3. `rclone mkdir gdrive:jimjak-collector`. `drive.file` 범위라 Drive 웹에서 직접 만든 폴더는 rclone이 못 본다.
+4. `collector/deploy/backup.sh`를 한 번 손으로 돌려 보고, `crontab.example`의 백업 줄을 `crontab -e`에 붙인다.
+
+### 맞는지 확인
+
+```bash
+rclone check collector/data/raw gdrive:jimjak-collector/raw --one-way --exclude "*.tmp"
+rclone lsl gdrive:jimjak-collector/db
+```
+
+`--one-way`는 서버에 있는 파일이 Drive에 모두 같은 내용으로 있는지만 본다. Drive에만 있는 오래된 원본은 정상이다. 마지막 백업 뒤에 받은 원본은 다음 백업 전까지 차이로 나온다.
+
+### 복구
+
+DB가 망가졌을 때(저장소 루트에서):
+
+```bash
+crontab -e    # 수집 줄을 주석 처리해 잠시 멈춘다
+rclone copy gdrive:jimjak-collector/raw collector/data/raw    # 서버에서 지운 30일 지난 원본까지 받는다
+rclone lsf gdrive:jimjak-collector/db                         # 가장 최근 스냅샷 이름을 본다
+rclone copyto gdrive:jimjak-collector/db/collector-2026-10-13.db.gz /tmp/collector.db.gz
+mv collector/data/collector.db collector/data/collector.db.broken
+rm -f collector/data/collector.db-wal collector/data/collector.db-shm
+gunzip -c /tmp/collector.db.gz > collector/data/collector.db
+python3 -m collector rebuild  # 스냅샷 뒤에 받은 원본까지 편 상태 표에 넣는다
+crontab -e    # 주석을 푼다
+```
+
+- `rebuild`는 편 상태 표(`snapshots`·`latest`)만 다시 만든다. 실행 기록(`runs`·`calls`)은 스냅샷을 뜬 시점까지만 남는다.
+- 서버를 통째로 잃었으면 [리눅스 서버](#리눅스-서버) 1~2단계로 코드와 `.env`를 놓는다. 그다음 위 「처음 한 번」 2단계로 rclone을 다시 연결하고, 위 명령으로 원본과 DB를 받는다. 받은 뒤 cron을 등록한다.
 
 ## 필드 확인 결과
 

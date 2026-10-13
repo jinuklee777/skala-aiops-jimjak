@@ -1,3 +1,6 @@
 # 리눅스 서버용. 경로를 고쳐서 `crontab -e`에 붙인다.
 # TZ는 로그 시각을 한국 시각으로 찍게 한다(수집 기록은 서버 시간대와 상관없이 한국 시각이다).
 */5 * * * * cd /home/ubuntu/skala-aiops-jimjak && TZ=Asia/Seoul /usr/bin/python3 -m collector tick >> /home/ubuntu/jimjak-collector.log 2>&1
+
+# Google Drive 백업: 하루 한 번. 서버 시간대가 UTC면 19:40 = 한국 04:40이다(README의 「백업과 복구」).
+40 19 * * * /home/ubuntu/skala-aiops-jimjak/collector/deploy/backup.sh >> /home/ubuntu/jimjak-backup.log 2>&1
