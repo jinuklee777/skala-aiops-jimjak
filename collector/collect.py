@@ -129,6 +129,7 @@ class Collector:
                 self._ingest(job, result, pages, observed_at)
         except Exception as error:  # 예기치 못한 오류도 실행 기록에 남기고 다음 작업으로 넘어간다
             log.exception("%s 수집 중 오류", job.name)
+            result.status = "failed"
             result.error = f"{type(error).__name__}: {error}"
         finally:
             db.finish_run(self.conn, result, iso(self.clock()))
@@ -202,6 +203,7 @@ class Collector:
             result.ingest = flights.ingest(self.conn, job.name, result.run_uid, observed_at, items, complete)
         except Exception as error:  # 원본은 이미 저장했다. 편 상태 표는 rebuild로 다시 만들 수 있다
             log.exception("편 상태 표 갱신 실패")
+            result.status = "failed"
             result.error = f"편 상태 표 갱신 실패: {error}"
 
 

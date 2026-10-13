@@ -2,6 +2,7 @@ import gzip
 import json
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from collector import archive, collect, db, flights
 from collector.collect import Busy, Collector
@@ -69,6 +70,16 @@ class CollectTest(unittest.TestCase):
         self.assertEqual(record["params"], {"type": "json", "searchDay": "0", "codeshare": "MA",
                                             "numOfRows": "3", "pageNo": "1"})
         self.assertEqual((record["http_status"], record["requested_at"]), (200, "2026-10-12T14:00:05+09:00"))
+
+    def test_storage_failure_is_failed_and_does_not_ping_heartbeat(self):
+        with patch('collector.collect.flights.ingest', side_effect=OSError('disk full')), \
+                patch('collector.collect.alerts.ping') as ping:
+            result = self.collector.run_now('arrivals')
+        self.assertEqual(result.status, 'failed')
+        self.assertIn('disk full', result.error)
+        self.assertEqual(db.last_run(self.conn, 'arrivals')['status'], 'failed')
+        self.assertTrue(list(self.cfg.raw_dir.glob('arrivals/*/*.json.gz')))
+        ping.assert_not_called()
 
     def test_keeps_paging_when_the_server_sends_smaller_pages(self):
         collector = Collector(make_config(self.tmp.name, self.server.url, num_of_rows=5),

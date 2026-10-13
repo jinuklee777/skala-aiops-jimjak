@@ -184,3 +184,11 @@ def set_notice(conn, name, state, sent_at) -> None:
         conn.execute("INSERT INTO notices (name, state, sent_at) VALUES (?, ?, ?) "
                      "ON CONFLICT (name) DO UPDATE SET state = excluded.state, sent_at = excluded.sent_at",
                      (name, state, sent_at))
+
+
+def readonly(path: Path) -> sqlite3.Connection:
+    """분석·내보내기는 DB 생성, WAL 설정 변경 없이 일관된 읽기 스냅샷을 사용한다."""
+    conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute("BEGIN")
+    return conn

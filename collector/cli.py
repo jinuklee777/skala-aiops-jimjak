@@ -6,10 +6,11 @@ import csv
 import json
 import logging
 import signal
+import sqlite3
 import sys
 from datetime import timedelta
 
-from collector import alerts, collect, db, flights
+from collector import alerts, collect, dataset, db, flights, quality
 from collector.config import iso, load_config, parse_time
 from collector.schedule import JOB_NAMES, PRIMARY_JOB
 
@@ -165,6 +166,31 @@ def cmd_rebuild(cfg, args):
     return 0
 
 
+def cmd_quality(cfg, args):
+    conn = db.readonly(cfg.db_path)
+    try:
+        result = quality.report(conn, parse_time(args.date).date(),
+                                as_of=parse_time(args.until) if args.until else None)
+    finally:
+        conn.close()
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_dataset(cfg, args):
+    conn = db.readonly(cfg.db_path)
+    try:
+        result = dataset.build(conn, until=parse_time(args.until) if args.until else None,
+                               horizon_minutes=args.horizon_minutes, max_gap_minutes=args.max_gap_minutes)
+    finally:
+        conn.close()
+    print(json.dumps({k: v for k, v in result.items() if k != "rows"}, ensure_ascii=False), file=sys.stderr)
+    for row in result["rows"]:
+        if not args.labeled_only or row["eligible_for_evaluation"]:
+            print(json.dumps(row, ensure_ascii=False))
+    return 0
+
+
 def cmd_notify_test(cfg, args):
     message = f"{alerts.PREFIX} 알림 시험. 이 메시지가 보이면 알림 설정이 된 것이다."
     channels = (
@@ -185,7 +211,8 @@ def cmd_notify_test(cfg, args):
 
 
 COMMANDS = {"tick": cmd_tick, "run": cmd_run, "status": cmd_status, "asof": cmd_asof,
-            "history": cmd_history, "rebuild": cmd_rebuild, "notify-test": cmd_notify_test}
+            "history": cmd_history, "rebuild": cmd_rebuild, "notify-test": cmd_notify_test,
+            "quality": cmd_quality, "dataset": cmd_dataset}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -207,6 +234,14 @@ def build_parser() -> argparse.ArgumentParser:
     history.add_argument("--job", default=PRIMARY_JOB, choices=JOB_NAMES)
     commands.add_parser("rebuild", help="원본 파일로 편별 상태 표를 다시 만든다")
     commands.add_parser("notify-test", help="웹훅·하트비트 설정을 시험한다")
+    quality_cmd = commands.add_parser("quality", help="예정일별 정답 누락·수정·편 키 연결을 JSON으로")
+    quality_cmd.add_argument("--date", required=True, help="도착 예정일. 시간대 표는 실제 착륙일 기준")
+    quality_cmd.add_argument("--until", help="이 시각까지 관측한 이력만 사용 (KST 또는 ISO)")
+    dataset_cmd = commands.add_parser("dataset", help="당시 ETA 기준 국제선 예측 입력과 정답 이력을 JSONL로")
+    dataset_cmd.add_argument("--until", help="이 시각까지 완료된 수집으로 재생 (KST 또는 ISO)")
+    dataset_cmd.add_argument("--horizon-minutes", type=int, default=60)
+    dataset_cmd.add_argument("--max-gap-minutes", type=int, default=10)
+    dataset_cmd.add_argument("--labeled-only", action="store_true", help="현재 유효한 정답을 확보한 표본만 출력")
     return parser
 
 
@@ -226,3 +261,6 @@ def main(argv=None) -> int:
     except Timeout as error:
         log.error("제한 시간 초과: %s", error)
         return 1
+    except (ValueError, sqlite3.Error) as error:
+        log.error("실행 오류: %s", error)
+        return 2

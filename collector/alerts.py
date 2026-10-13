@@ -11,7 +11,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta
 
-from collector import __version__, db, flights
+from collector import __version__, db, quality
 from collector.config import KST, iso, parse_time
 from collector.schedule import PRIMARY_JOB
 
@@ -134,28 +134,12 @@ def send_daily_report(collector) -> None:
     db.set_notice(collector.conn, "report", today, iso(now))
 
 
-def label_counts(conn, day) -> dict:
-    """그날 도착 예정편(최신 상태 기준)의 정답(마지막 짐 시각) 확보 현황."""
-    counts = dict.fromkeys(("flights", "cancelled", "no_carousel", "arrived", "with_last",
-                            "late_arrived", "late_with_last"), 0)
-    for row in conn.execute("SELECT item FROM latest WHERE job = ? AND flight_key LIKE ?",
-                            (PRIMARY_JOB, f"%|{day:%Y%m%d}%")):
-        item = json.loads(row["item"])
-        counts["flights"] += 1
-        remark = flights.text(item, "remark")
-        if remark == "결항":
-            counts["cancelled"] += 1
-            continue
-        counts["no_carousel"] += not flights.text(item, "bagCarouselId")
-        if remark != "도착":
-            continue
-        has_last = bool(flights.text(item, "bagLastTime"))
-        counts["arrived"] += 1
-        counts["with_last"] += has_last
-        if flights.text(item, "scheduleDatetime")[8:10] == "23":
-            counts["late_arrived"] += 1
-            counts["late_with_last"] += has_last
-    return counts
+def label_counts(conn, day, as_of=None, loaded=None) -> dict:
+    """연결된 운항편 기준 집계. 늦은 편은 실제 착륙일·시각 기준 국제선이다."""
+    report = quality.report(conn, day, as_of=as_of, loaded=loaded)
+    late = report['international_by_landing_hour'].get('23', {'landed': 0, 'with_last': 0})
+    return {**{k: report[k] for k in ('flights', 'cancelled', 'no_carousel', 'arrived', 'with_last')},
+            'late_arrived': late['landed'], 'late_with_last': late['with_last'], 'quality': report}
 
 
 def daily_summary(collector, day) -> dict:
@@ -169,6 +153,8 @@ def daily_summary(collector, day) -> dict:
     statuses = {}
     for row in db.runs_between(conn, PRIMARY_JOB, iso(start), iso(end)):
         statuses.setdefault(row["slot"], set()).add(row["status"])
+    now = collector.clock()
+    loaded = quality.load_tracks(conn, until=now)
     summary = {
         "day": day,
         "expected": len(expected),
@@ -180,9 +166,11 @@ def daily_summary(collector, day) -> dict:
         "daily_limit": cfg.daily_limit,
         "raw_bytes": sum(path.stat().st_size for path in cfg.raw_dir.glob(f"*/{day.isoformat()}/*.json.gz")),
         "disk_free": shutil.disk_usage(cfg.data_dir).free,
-        **label_counts(conn, day),
+        **label_counts(conn, day, as_of=now, loaded=loaded),
     }
-    previous = [label_counts(conn, day - timedelta(days=k))["flights"] for k in range(1, 8)]
+    previous = [sum(quality.moment(t.item, 'scheduleDatetime') is not None and
+                    quality.moment(t.item, 'scheduleDatetime').date() == day - timedelta(days=k)
+                    for t in loaded[0].values()) for k in range(1, 8)]
     previous = [count for count in previous if count]
     summary["usual_flights"] = statistics.median(previous) if len(previous) >= 3 else None
     summary["warnings"] = warnings_for(summary)
@@ -202,6 +190,15 @@ def warnings_for(s) -> list:
         warnings.append(f"호출 수({s['calls']})가 하루 한도({s['daily_limit']})에 가까움")
     if s["disk_free"] < MIN_FREE_BYTES:
         warnings.append(f"디스크 여유가 {s['disk_free'] / 1e9:.1f}GB뿐")
+    report = s.get('quality', {})
+    missing = [m for m in report.get('missing', []) if m['type_of_flight'] == 'I' and m['landing_at']]
+    if missing:
+        names = ', '.join(m['aliases'][-1].split('|')[0] for m in missing[:8])
+        warnings.append(f"국제선 착륙 후 마지막 짐 미확보 {len(missing)}편 (응답 소실 또는 120분 경과): {names}")
+    if s['late_with_last'] < s['late_arrived']:
+        warnings.append(f"23시대 국제선 마지막 짐 미확보 {s['late_arrived'] - s['late_with_last']}편")
+    if report.get('statuses', {}).get('invalid'):
+        warnings.append(f"시각 순서·형식 또는 편 연결 점검 필요 {report['statuses']['invalid']}편")
     return warnings
 
 
@@ -218,7 +215,8 @@ def format_summary(s) -> str:
         f"- 호출: {s['calls']}회 (하루 한도 {s['daily_limit']})",
         f"- 도착 예정 {s['flights']}편: 결항 {s['cancelled']}, 수취대 미배정 {s['no_carousel']}, "
         f"도착 {s['arrived']}편 중 마지막 짐 시각 확보 {s['with_last']}편{percent(s['with_last'], s['arrived'])}",
-        f"- 23시대 도착 {s['late_arrived']}편 중 마지막 짐 시각 확보 {s['late_with_last']}편",
+        f"- 실제 23시대 착륙 국제선 {s['late_arrived']}편 중 마지막 짐 시각 확보 {s['late_with_last']}편",
+        f"- 정답 수정·철회 {len(s['quality']['label_revisions'])}편 · 예정시각 변경 연결 {len(s['quality']['identity_links'])}건",
         f"- 원본: {s['raw_bytes'] / 1e6:.1f}MB · 디스크 여유 {s['disk_free'] / 1e9:.1f}GB",
     ]
     return "\n".join(lines + [f"⚠ {warning}" for warning in s["warnings"]])
